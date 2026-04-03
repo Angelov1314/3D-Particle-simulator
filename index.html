@@ -99,6 +99,7 @@
         </div>
         <div class="btn-row">
             <button class="btn" id="btn-ripple" onclick="toggleFX('ripple')">ripple</button>
+            <button class="btn" id="btn-erode" onclick="toggleFX('erode')">erode</button>
         </div>
     </div>
 
@@ -141,7 +142,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 let scene, camera, renderer, controls, points, composer, bloomPass;
 let cachedVertices = null, cachedGltf = null, cachedColors = null;
 let colorMode = 'untextured', physicsMode = 'linear';
-let fx = { flicker: false, holo: false, curl: false, spring: false, bloom: false, ripple: false };
+let fx = { flicker: false, holo: false, curl: false, spring: false, bloom: false, ripple: false, erode: false };
 let mouseWorld = new THREE.Vector2(-999, -999); // lerp target, starts off-screen
 let holoTime = 0; // tracks holo flicker phase
 
@@ -161,6 +162,7 @@ const vertexShader = `
     uniform bool uHolo;
     uniform bool uCurl;
     uniform bool uRipple;
+    uniform bool uErode;
     uniform vec2 uPalm;
     uniform vec2 uMouse;       // world-space XY of cursor, lerp-smoothed
     uniform float uHoloBrightness;
@@ -395,20 +397,15 @@ const vertexShader = `
             vec2 worldXY = (modelMatrix * vec4(pos, 1.0)).xy;
             float d = distance(worldXY, uMouse);
             // Repulsion radius in world units
-            float radius = 2.5;
-            // Smooth falloff: 1.0 at cursor center, 0.0 at edge
+            float radius = 1.8;
             float strength = smoothstep(radius, 0.0, d);
-            // Cubic ease for punchier core push
             strength = strength * strength;
             if(d > 0.001){
                 vec2 pushDir = normalize(worldXY - uMouse);
-                // Push particles outward — up to 2.0 units at dead center
-                pos.xy += pushDir * strength * 2.0;
+                pos.xy += pushDir * strength * 0.8;
             }
-            // Slight Z warp at the edge — gives a "lens distortion" feel
-            pos.z += strength * 0.4 * sin(d * 5.0 + uTime * 2.0);
-            // Particles near cursor glow brighter (energy feel)
-            vBrightBoost *= 1.0 + strength * 0.6;
+            pos.z += strength * 0.15 * sin(d * 5.0 + uTime * 2.0);
+            vBrightBoost *= 1.0 + strength * 0.3;
         }
 
         // ── Flicker: jitter position slightly ────────────────────────────────
@@ -418,17 +415,45 @@ const vertexShader = `
             pos += aRandom * flickerOn * 0.02;
         }
 
+        // ── Erosion / weathering ─────────────────────────────────────────────
+        // 3D noise carves irregular holes that slowly crawl across the model.
+        // Eroded particles shrink to dust and drift away like sand in wind.
+        float erodeAlpha = 1.0; // 1.0 = fully visible, 0.0 = eroded away
+        if(uErode){
+            // Multi-octave noise for organic, fractal-edge erosion
+            vec3 noiseCoord = position * 1.8 + vec3(uTime * 0.06, uTime * 0.04, uTime * -0.05);
+            float n = snoise(noiseCoord) * 0.6
+                    + snoise(noiseCoord * 2.3 + 5.0) * 0.3
+                    + snoise(noiseCoord * 5.7 + 11.0) * 0.1;
+            // Threshold: particles with noise below threshold are "eaten"
+            // The threshold slowly oscillates so erosion breathes in and out
+            float threshold = sin(uTime * 0.15) * 0.15 + 0.1;
+            // Smooth transition zone at the erosion edge
+            float edge = smoothstep(threshold - 0.12, threshold + 0.05, n);
+            erodeAlpha = edge;
+            // Eroded particles: drift away like windblown dust
+            if(erodeAlpha < 0.5){
+                float drift = (1.0 - erodeAlpha * 2.0); // 0→1 as more eroded
+                // Wind direction: mostly +X with some upward
+                pos.x += drift * 0.8 * (0.5 + aOffset);
+                pos.y += drift * 0.3 * sin(uTime * 0.7 + aOffset * 4.0);
+                pos.z += drift * 0.2 * cos(uTime * 0.5 + aOffset * 3.0);
+                // Shrink eroded particles
+                erodeAlpha = max(erodeAlpha, 0.02); // keep a tiny speck visible
+            }
+        }
+
         // ── Base float ───────────────────────────────────────────────────────
         pos.y += sin(uTime * 0.5 + aOffset) * 0.02;
 
         vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
         float baseSize = uFlicker ? (15.0 + flickerOn * 6.0) : 15.0;
-        // In 4D mode, projScale makes near-projected particles physically larger
-        gl_PointSize = baseSize * projScale / -mvPosition.z;
+        // Eroded particles shrink; 4D projScale for depth
+        gl_PointSize = baseSize * projScale * erodeAlpha / -mvPosition.z;
         gl_Position = projectionMatrix * mvPosition;
 
         vWorldPos = (modelMatrix * vec4(pos, 1.0)).xyz;
-        vOpacity = 1.0 - uProgress * 0.8;
+        vOpacity = (1.0 - uProgress * 0.8) * erodeAlpha;
         vBrightBoost = uFlicker ? (0.6 + flickerOn * 0.4) : 1.0;
         vHoloBrightness = uHolo ? uHoloBrightness : 1.0;
 
@@ -612,6 +637,7 @@ function buildPoints(vertices, colors) {
             uHoloBrightness:  { value: 1.0 },
             uCurl:            { value: false },
             uRipple:          { value: false },
+            uErode:           { value: false },
             uMouse:           { value: new THREE.Vector2(-999, -999) },
             uPalm:            { value: new THREE.Vector2(0, 0) }
         },
@@ -634,6 +660,7 @@ function syncUniforms() {
     u.uHolo.value      = fx.holo;
     u.uCurl.value      = fx.curl;
     u.uRipple.value    = fx.ripple;
+    u.uErode.value     = fx.erode;
 }
 
 // ─── Holo flicker: cyberpunk hologram brightness ──────────────────────────────
