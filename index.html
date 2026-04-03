@@ -347,17 +347,15 @@ const fragmentShader = `
 
     void main(){
         float d = distance(gl_PointCoord, vec2(0.5));
-        float strength;
+        float strength = clamp(0.05 / d - 0.1, 0.0, 1.0);
+        float finalBright = vBrightBoost * vHoloBrightness;
+        vec3 col = vColor;
         if (uColorMode == 1) {
-            // Texture mode (NormalBlending): use a crisp soft-circle so individual
-            // particles are clearly visible and colour is not diluted by near-zero alpha.
-            strength = smoothstep(0.5, 0.18, d);
-        } else {
-            // Additive glow mode: classic 1/d falloff
-            strength = clamp(0.05 / d - 0.1, 0.0, 1.0);
+            // Texture mode: reduce additive brightness to prevent dense
+            // regions from washing out (pink stamen → yellow).
+            col *= 0.6;
         }
-        float finalBright = (uColorMode == 1) ? vHoloBrightness : vBrightBoost * vHoloBrightness;
-        gl_FragColor = vec4(vColor * finalBright, strength * vOpacity * vHoloBrightness);
+        gl_FragColor = vec4(col * finalBright, strength * vOpacity * vHoloBrightness);
     }
 `;
 
@@ -369,11 +367,6 @@ camera.position.set(0, 1, 5);
 renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-// Correct colour pipeline: prevents sRGB→linear double-conversion that causes
-// pinks to shift orange/yellow under bloom and additive lighting
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
 document.getElementById('container').appendChild(renderer.domElement);
 
 controls = new OrbitControls(camera, renderer.domElement);
@@ -388,8 +381,10 @@ bloomPass.enabled = false;
 
 // ─── Texture sampler ─────────────────────────────────────────────────────────
 // Reads the full image ONCE into a flat array, then does O(1) lookups per UV.
-// Applies sRGB→linear conversion (pow 2.2) so colors match the original GLB
-// appearance instead of looking washed-out / hue-shifted under additive lighting.
+// Respects texture.flipY (GLB sets flipY=false, meaning V=0 is at top of image).
+// Applies texture.offset/repeat transforms for correct UV→pixel mapping.
+// No gamma conversion — ShaderMaterial bypasses Three.js color management,
+// so raw sRGB canvas pixels → shader → screen is the correct pipeline.
 function buildTextureSampler(texture) {
     const img = texture.image;
     const w = img.width, h = img.height;
@@ -397,17 +392,28 @@ function buildTextureSampler(texture) {
     canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext('2d');
     ctx.drawImage(img, 0, 0);
-    const data = ctx.getImageData(0, 0, w, h).data; // read entire image once
+    const data = ctx.getImageData(0, 0, w, h).data;
+
+    // Texture transforms (offset, repeat)
+    const ox = texture.offset ? texture.offset.x : 0;
+    const oy = texture.offset ? texture.offset.y : 0;
+    const rx = texture.repeat ? texture.repeat.x : 1;
+    const ry = texture.repeat ? texture.repeat.y : 1;
+    const flip = texture.flipY;  // true for normal textures, false for GLB
+
     return (u, v) => {
-        const x = Math.min(w - 1, Math.floor(((u % 1) + 1) % 1 * w));
-        const y = Math.min(h - 1, Math.floor((1 - ((v % 1) + 1) % 1) * h));
-        const i = (y * w + x) * 4;
-        // sRGB → linear (gamma 2.2) so Three.js linear pipeline gets correct values
-        return [
-            Math.pow(data[i]     / 255, 2.2),
-            Math.pow(data[i + 1] / 255, 2.2),
-            Math.pow(data[i + 2] / 255, 2.2)
-        ];
+        // Apply repeat + offset
+        let tu = u * rx + ox;
+        let tv = v * ry + oy;
+        // Wrap to [0,1]
+        tu = ((tu % 1) + 1) % 1;
+        tv = ((tv % 1) + 1) % 1;
+        // Canvas y=0 is top. For flipY=true (standard), V=0 is bottom → need 1-tv.
+        // For flipY=false (GLB), V=0 is already top → use tv directly.
+        const px = Math.min(w - 1, Math.floor(tu * w));
+        const py = Math.min(h - 1, Math.floor((flip ? (1 - tv) : tv) * h));
+        const i = (py * w + px) * 4;
+        return [data[i] / 255, data[i + 1] / 255, data[i + 2] / 255];
     };
 }
 
@@ -482,12 +488,7 @@ function buildPoints(vertices, colors) {
             uPalm:            { value: new THREE.Vector2(0, 0) }
         },
         vertexShader, fragmentShader,
-        transparent: true,
-        // Texture mode uses NormalBlending to prevent additive color wash-out
-        // (dense pink particles would otherwise saturate into yellow at the stamen).
-        // All other modes keep AdditiveBlending for the glowing particle look.
-        blending: colorMode === 'textured' ? THREE.NormalBlending : THREE.AdditiveBlending,
-        depthWrite: false
+        transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
     });
 
     points = new THREE.Points(geometry, material);
