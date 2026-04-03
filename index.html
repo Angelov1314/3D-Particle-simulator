@@ -163,6 +163,7 @@ const vertexShader = `
     uniform bool uCurl;
     uniform bool uRipple;
     uniform bool uErode;
+    uniform float uErodePhase; // 0→1 full cycle: 0=intact, 0.6=fully eroded, 1=reassembled
     uniform vec2 uPalm;
     uniform vec2 uMouse;       // world-space XY of cursor, lerp-smoothed
     uniform float uHoloBrightness;
@@ -416,52 +417,70 @@ const vertexShader = `
         }
 
         // ── Erosion / weathering ─────────────────────────────────────────────
-        // 3D noise carves irregular holes that slowly crawl across the model.
-        // Eroded particles shrink to dust and drift away like sand in wind.
-        float erodeAlpha = 1.0; // 1.0 = fully visible, 0.0 = eroded away
+        // Full lifecycle driven by uErodePhase (JS):
+        //   0.0 → 0.55 : erosion front sweeps across — particles peel off
+        //   0.55→ 0.70 : fully eroded, all debris floating
+        //   0.70→ 1.00 : reassembly — particles fly back and snap into shape
+        float erodeAlpha = 1.0;
         if(uErode){
-            // Multi-octave noise for organic, fractal-edge erosion
-            vec3 noiseCoord = position * 1.8 + vec3(uTime * 0.06, uTime * 0.04, uTime * -0.05);
+            // Static noise per particle (no time drift) so each particle has a
+            // fixed "resistance" value — lower = erodes first
+            vec3 noiseCoord = position * 1.8;
             float n = snoise(noiseCoord) * 0.6
                     + snoise(noiseCoord * 2.3 + 5.0) * 0.3
                     + snoise(noiseCoord * 5.7 + 11.0) * 0.1;
-            // Threshold: particles with noise below threshold are "eaten"
-            // The threshold slowly oscillates so erosion breathes in and out
-            float threshold = sin(uTime * 0.15) * 0.15 + 0.1;
-            // Smooth transition zone at the erosion edge
-            float edge = smoothstep(threshold - 0.12, threshold + 0.05, n);
+            // n is in ~[-1, 1]; remap to [0, 1]
+            float resistance = n * 0.5 + 0.5;
+
+            // Erode phase: threshold sweeps 0→1 eroding everything
+            // Reassemble phase: threshold sweeps 1→0 restoring everything
+            float threshold;
+            bool reassembling = uErodePhase > 0.70;
+            if(!reassembling){
+                // 0→0.55: sweep threshold from -0.1 to 1.1 (eat all particles)
+                threshold = (uErodePhase / 0.55) * 1.2 - 0.1;
+            } else {
+                // 0.70→1.0: sweep threshold back from 1.1 to -0.1
+                float t = (uErodePhase - 0.70) / 0.30;
+                threshold = 1.1 - t * 1.2;
+            }
+            float edge = smoothstep(threshold - 0.08, threshold + 0.08, resistance);
             erodeAlpha = edge;
 
-            // ── Edge particles: peel off and stream away ─────────────────────
-            // Particles near the erosion boundary (0.1 < alpha < 0.6) are the
-            // "crumbling edge". They stay visible and fly outward like debris.
-            // Deeper eroded particles (alpha < 0.1) vanish completely.
-            if(erodeAlpha < 0.6){
-                // How far into the eroded zone: 0=edge, 1=deep
-                float depth = 1.0 - clamp(erodeAlpha / 0.6, 0.0, 1.0);
-                // Each particle gets a staggered launch time based on its hash
-                float launchTime = fract(sin(aOffset * 317.5) * 9471.3) * 4.0;
-                float flyTime = max(0.0, mod(uTime * 0.4, 5.0) - launchTime);
-                flyTime = min(flyTime, 3.0); // cap flight duration
-                float flyProgress = flyTime / 3.0; // 0→1 over 3 seconds
-
-                // Only edge particles (depth < 0.7) actually fly; deep ones vanish
-                if(depth < 0.7){
-                    // Wind direction: outward from model center + rightward breeze
+            if(!reassembling){
+                // ── Eroding: edge particles peel off and fly away ────────────
+                if(erodeAlpha < 0.7){
+                    float depth = 1.0 - clamp(erodeAlpha / 0.7, 0.0, 1.0);
+                    // Each particle has a unique launch slot
+                    float seed = fract(sin(aOffset * 317.5) * 9471.3);
+                    // Wind: outward from surface + upward-rightward breeze
                     vec3 outDir = normalize(position + vec3(0.001));
-                    vec3 wind = vec3(0.6, 0.3, 0.0); // gentle breeze
-                    vec3 flyDir = normalize(outDir * 0.5 + wind);
-                    // Accelerate outward over flight time
-                    pos += flyDir * flyProgress * flyProgress * 3.0 * (0.5 + depth);
-                    // Tumble: slight random wobble during flight
-                    pos.x += sin(uTime * 2.0 + aOffset * 8.0) * flyProgress * 0.15;
-                    pos.y += cos(uTime * 1.7 + aOffset * 6.0) * flyProgress * 0.1;
-                    // Stay visible during flight, fade at end
-                    erodeAlpha = 0.3 + 0.7 * (1.0 - flyProgress * flyProgress);
-                } else {
-                    // Deep eroded: invisible
-                    erodeAlpha = 0.0;
+                    vec3 wind = normalize(vec3(0.5, 0.4, 0.1));
+                    vec3 flyDir = normalize(outDir * 0.4 + wind * 0.6);
+                    // flyProgress: how long since this particle was "freed"
+                    float flyProgress = clamp(depth * 2.5, 0.0, 1.0);
+                    pos += flyDir * flyProgress * flyProgress * 3.5;
+                    // Tumble
+                    pos.x += sin(uTime * 1.8 + seed * 20.0) * flyProgress * 0.2;
+                    pos.y += cos(uTime * 1.4 + seed * 15.0) * flyProgress * 0.12;
+                    // Visible edge debris, invisible deep eroded
+                    erodeAlpha = depth < 0.7
+                        ? 0.5 + 0.5 * (1.0 - flyProgress)
+                        : 0.0;
                 }
+            } else {
+                // ── Reassembling: particles fly BACK to original position ────
+                float t = (uErodePhase - 0.70) / 0.30; // 0→1
+                // Each particle waits for its resistance slot before returning
+                float delay = 1.0 - resistance; // high-resistance particles return last
+                float localT = clamp((t - delay * 0.4) / 0.6, 0.0, 1.0);
+                float ease = localT * localT * (3.0 - 2.0 * localT); // smoothstep ease
+                // Start dispersed (match erode dispersion), fly back to origin
+                vec3 outDir = normalize(position + vec3(0.001));
+                vec3 dispersedPos = position + outDir * 3.5 + vec3(1.8, 1.4, 0.4) * 0.5;
+                pos = mix(dispersedPos, position, ease);
+                // Alpha fades in as particle arrives
+                erodeAlpha = ease;
             }
         }
 
@@ -660,6 +679,7 @@ function buildPoints(vertices, colors) {
             uCurl:            { value: false },
             uRipple:          { value: false },
             uErode:           { value: false },
+            uErodePhase:      { value: 0.0 },
             uMouse:           { value: new THREE.Vector2(-999, -999) },
             uPalm:            { value: new THREE.Vector2(0, 0) }
         },
@@ -683,6 +703,7 @@ function syncUniforms() {
     u.uCurl.value      = fx.curl;
     u.uRipple.value    = fx.ripple;
     u.uErode.value     = fx.erode;
+    // uErodePhase is driven in the animate loop, not here
 }
 
 // ─── Holo flicker: cyberpunk hologram brightness ──────────────────────────────
@@ -1009,6 +1030,20 @@ function animate() {
         const u = points.material.uniforms;
         u.uTime.value     = time;
         u.uProgress.value = Math.max(0, Math.min(1, currentProgress));
+        // Erode cycle: 8s erode, 2s hold, 5s reassemble, 3s pause → repeat
+        if (fx.erode) {
+            const cycleDur = 18.0; // total cycle seconds
+            const cycleT = (time % cycleDur) / cycleDur; // 0→1
+            // Map: 0→0.44=erode, 0.44→0.55=hold, 0.55→0.83=reassemble, 0.83→1=pause
+            let phase;
+            if (cycleT < 0.44)      phase = (cycleT / 0.44) * 0.55;          // eroding
+            else if (cycleT < 0.55) phase = 0.55 + (cycleT - 0.44) / 0.11 * 0.15; // hold
+            else if (cycleT < 0.83) phase = 0.70 + (cycleT - 0.55) / 0.28 * 0.30; // reassemble
+            else                    phase = 0.0;                               // pause/reset
+            u.uErodePhase.value = phase;
+        } else {
+            u.uErodePhase.value = 0.0; // fully intact when off
+        }
         u.uPalm.value.set(palmX, palmY);
         // Mouse tracking: fast follow (0.15) when mouse moves toward model,
         // slow recovery (0.03) when mouse moves away → repulsion lingers
