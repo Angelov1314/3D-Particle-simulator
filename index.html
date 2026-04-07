@@ -44,6 +44,32 @@
         }
         .upload-btn:hover { border-color: #445; color: #99a; }
 
+        /* Sculpt mode */
+        .slider-row { display: flex; align-items: center; gap: 6px; }
+        .slider-row label { color: #667; font-size: 9px; min-width: 40px; }
+        .slider-row input[type="range"] {
+            -webkit-appearance: none; appearance: none; flex: 1;
+            height: 2px; background: #333; border-radius: 2px; outline: none;
+        }
+        .slider-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none; width: 10px; height: 10px;
+            border-radius: 50%; background: #00ffcc; cursor: pointer;
+        }
+        .slider-row .val { color: #556; font-size: 9px; min-width: 22px; text-align: right; }
+        #sculpt-section { display: none; }
+        #sculpt-section.visible { display: flex; }
+        .color-swatch {
+            width: 18px; height: 18px; border-radius: 3px; border: 1px solid #333;
+            cursor: pointer; padding: 0; outline: none;
+        }
+        .color-swatch::-webkit-color-swatch-wrapper { padding: 0; }
+        .color-swatch::-webkit-color-swatch { border: none; border-radius: 2px; }
+        .sculpt-brush-indicator {
+            position: fixed; pointer-events: none; z-index: 15;
+            border: 1px solid rgba(0,255,200,0.4); border-radius: 50%;
+            transform: translate(-50%, -50%); display: none;
+        }
+
         /* Fullscreen: fade out ALL UI, reveal on mouse move */
         #ui-overlay {
             transition: opacity 0.5s;
@@ -85,6 +111,7 @@
 <body>
 
 <div id="container"></div>
+<div class="sculpt-brush-indicator" id="brush-cursor"></div>
 <audio id="bgm" loop preload="auto"></audio>
 
 <div id="ui-overlay">
@@ -107,6 +134,59 @@
             <button class="btn" id="btn-music" onclick="toggleMusicBar()" title="music">♪ music</button>
         </div>
     </div>
+    <div class="panel-section">
+        <div class="panel-label">mode</div>
+        <div class="btn-row">
+            <button class="btn active" id="btn-mode-particle" onclick="setMode('particle')">particles</button>
+            <button class="btn" id="btn-mode-sculpt" onclick="setMode('sculpt')">sculpt</button>
+        </div>
+    </div>
+
+    <div class="panel-section" id="sculpt-section">
+        <div class="panel-label">sculpt</div>
+        <div class="btn-row">
+            <button class="btn active" id="btn-brush-push" onclick="setBrush('push')">push</button>
+            <button class="btn" id="btn-brush-pull" onclick="setBrush('pull')">pull</button>
+            <button class="btn" id="btn-brush-smooth" onclick="setBrush('smooth')">smooth</button>
+        </div>
+        <div class="slider-row">
+            <label>size</label>
+            <input type="range" min="0.1" max="3" step="0.1" value="1.0" id="brush-size">
+            <span class="val" id="brush-size-val">1.0</span>
+        </div>
+        <div class="slider-row">
+            <label>strength</label>
+            <input type="range" min="0.01" max="0.5" step="0.01" value="0.1" id="brush-strength">
+            <span class="val" id="brush-strength-val">0.10</span>
+        </div>
+        <div class="panel-label" style="margin-top:6px">body sliders</div>
+        <div class="slider-row">
+            <label>head</label>
+            <input type="range" min="0.5" max="2.0" step="0.05" value="1.0" id="sl-head">
+            <span class="val" id="sl-head-val">1.0</span>
+        </div>
+        <div class="slider-row">
+            <label>torso</label>
+            <input type="range" min="0.5" max="2.0" step="0.05" value="1.0" id="sl-torso">
+            <span class="val" id="sl-torso-val">1.0</span>
+        </div>
+        <div class="slider-row">
+            <label>legs</label>
+            <input type="range" min="0.5" max="2.0" step="0.05" value="1.0" id="sl-legs">
+            <span class="val" id="sl-legs-val">1.0</span>
+        </div>
+        <div class="panel-label" style="margin-top:6px">zone colors</div>
+        <div class="btn-row" style="align-items:center">
+            <label style="color:#667;font-size:9px">head</label>
+            <input type="color" class="color-swatch" id="zc-head" value="#80ccff">
+            <label style="color:#667;font-size:9px">body</label>
+            <input type="color" class="color-swatch" id="zc-body" value="#80ccff">
+            <label style="color:#667;font-size:9px">legs</label>
+            <input type="color" class="color-swatch" id="zc-legs" value="#80ccff">
+        </div>
+        <button class="btn" onclick="resetSculpt()" style="margin-top:6px">↺ reset shape</button>
+    </div>
+
     <div class="panel-section">
         <div class="panel-label">color</div>
         <div class="btn-row">
@@ -201,6 +281,14 @@ let scene, camera, renderer, controls, points, composer, bloomPass;
 let cachedVertices = null, cachedGltf = null, cachedColors = null;
 let colorMode = 'untextured', physicsMode = 'linear';
 let fx = { flicker: false, holo: false, curl: false, spring: false, bloom: false, ripple: false, erode: false, blueTears: false };
+
+// Sculpt mode
+let sculptMode = false;
+let brushType = 'push'; // push, pull, smooth
+let brushSize = 1.0;
+let brushStrength = 0.1;
+let sculptMouseDown = false;
+let modelBoundsY = { min: -1, max: 1 }; // updated when model loads
 let mouseWorld = new THREE.Vector2(-999, -999); // lerp target, starts off-screen
 let holoTime = 0; // tracks holo flicker phase
 
@@ -226,9 +314,21 @@ const vertexShader = `
     uniform vec2 uMouse;       // world-space XY of cursor, lerp-smoothed
     uniform float uHoloBrightness;
 
+    // Sculpt mode
+    uniform bool uSculptMode;
+    uniform float uHeadScale;
+    uniform float uTorsoScale;
+    uniform float uLegScale;
+    uniform vec3 uZoneColorHead;
+    uniform vec3 uZoneColorBody;
+    uniform vec3 uZoneColorLegs;
+    uniform float uModelYMin;   // model bounding box Y min
+    uniform float uModelYMax;   // model bounding box Y max
+
     attribute vec3 aRandom;
     attribute float aOffset;
     attribute vec3 aColor;
+    attribute vec3 aDeformation;  // persistent sculpt offsets
 
     varying vec3 vColor;
     varying float vOpacity;
@@ -307,6 +407,27 @@ const vertexShader = `
 
     void main(){
         vec3 pos = position;
+
+        // ── Sculpt: apply persistent deformation ─────────────────────────────
+        pos += aDeformation;
+
+        // ── Sculpt: body zone scaling ────────────────────────────────────────
+        if(uSculptMode || uHeadScale != 1.0 || uTorsoScale != 1.0 || uLegScale != 1.0){
+            float yRange = uModelYMax - uModelYMin;
+            float yNorm = (pos.y - uModelYMin) / max(yRange, 0.001); // 0=bottom, 1=top
+
+            // Zone boundaries (normalized): legs 0-0.4, torso 0.4-0.75, head 0.75-1.0
+            float legT    = smoothstep(0.0, 0.4, yNorm);
+            float torsoT  = smoothstep(0.4, 0.75, yNorm);
+            float headT   = smoothstep(0.75, 1.0, yNorm);
+
+            // Scale XZ per zone, keeping Y position intact
+            float zoneScale = mix(uLegScale, uTorsoScale, legT);
+            zoneScale = mix(zoneScale, uHeadScale, torsoT);
+
+            // Find model center X/Z (assume ~0) and scale outward
+            pos.xz *= zoneScale;
+        }
 
         // ── Physics ───────────────────────────────────────────────────────────
         float projScale = 1.0; // overridden by 4D projection in mode 5
@@ -578,6 +699,15 @@ const vertexShader = `
             pos.xz += vec2(sin(uTime*8.+aOffset*20.), cos(uTime*7.+aOffset*15.)) * temperature * 0.08;
             vColor *= (0.7 + temperature * 0.5);
 
+        } else if(uColorMode == 4){
+            // Zone coloring: head/body/legs colored by Y position
+            float yRange = uModelYMax - uModelYMin;
+            float yN = (position.y - uModelYMin) / max(yRange, 0.001);
+            float legW   = 1.0 - smoothstep(0.35, 0.45, yN);
+            float headW  = smoothstep(0.70, 0.80, yN);
+            float torsoW = 1.0 - legW - headW;
+            vColor = uZoneColorLegs * legW + uZoneColorBody * torsoW + uZoneColorHead * headW;
+
         } else if(uColorMode == 1){
             // Textured: use aColor attribute
             vColor = aColor;
@@ -725,6 +855,10 @@ function buildPoints(vertices, colors) {
     geometry.setAttribute('aOffset', new THREE.BufferAttribute(offsets, 1));
     geometry.setAttribute('aColor', new THREE.BufferAttribute(new Float32Array(colors), 3));
 
+    // Sculpt deformation buffer (persistent offsets)
+    const deformation = new Float32Array(count * 3);
+    geometry.setAttribute('aDeformation', new THREE.BufferAttribute(deformation, 3));
+
     const material = new THREE.ShaderMaterial({
         uniforms: {
             uTime:               { value: 0 },
@@ -739,7 +873,16 @@ function buildPoints(vertices, colors) {
             uErode:              { value: false },
             uErodePhase:         { value: 0.0 },
             uMouse:              { value: new THREE.Vector2(-999, -999) },
-            uPalm:               { value: new THREE.Vector2(0, 0) }
+            uPalm:               { value: new THREE.Vector2(0, 0) },
+            uSculptMode:         { value: false },
+            uHeadScale:          { value: 1.0 },
+            uTorsoScale:         { value: 1.0 },
+            uLegScale:           { value: 1.0 },
+            uZoneColorHead:      { value: new THREE.Vector3(0.5, 0.8, 1.0) },
+            uZoneColorBody:      { value: new THREE.Vector3(0.5, 0.8, 1.0) },
+            uZoneColorLegs:      { value: new THREE.Vector3(0.5, 0.8, 1.0) },
+            uModelYMin:          { value: modelBoundsY.min },
+            uModelYMax:          { value: modelBoundsY.max }
         },
         vertexShader, fragmentShader,
         transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
@@ -755,12 +898,15 @@ function syncUniforms() {
     if (!points) return;
     const u = points.material.uniforms;
     u.uPhysics.value   = ['linear','vortex','accretion','gravity','drift','tesseract','aizawa'].indexOf(physicsMode);
-    u.uColorMode.value = ['untextured','textured','aurora','thermal'].indexOf(colorMode);
+    u.uColorMode.value = ['untextured','textured','aurora','thermal','zone'].indexOf(colorMode);
     u.uFlicker.value   = fx.flicker;
     u.uHolo.value      = fx.holo;
     u.uCurl.value      = fx.curl;
     u.uRipple.value    = fx.ripple;
     u.uErode.value     = fx.erode;
+    u.uSculptMode.value = sculptMode;
+    u.uModelYMin.value  = modelBoundsY.min;
+    u.uModelYMax.value  = modelBoundsY.max;
     // uErodePhase is driven in the animate loop, not here
 }
 
@@ -888,11 +1034,21 @@ window.resetQueue = function() {
 // ─── Load model ───────────────────────────────────────────────────────────────
 function extractVertices(gltf) {
     const vertices = [];
+    let yMin = Infinity, yMax = -Infinity;
     gltf.scene.traverse((child) => {
         if (!child.isMesh) return;
         const pos = child.geometry.attributes.position;
-        for (let i = 0; i < pos.count; i++) vertices.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+        for (let i = 0; i < pos.count; i++) {
+            const y = pos.getY(i);
+            if (y < yMin) yMin = y;
+            if (y > yMax) yMax = y;
+            vertices.push(pos.getX(i), y, pos.getZ(i));
+        }
     });
+    if (yMin !== Infinity) {
+        modelBoundsY.min = yMin;
+        modelBoundsY.max = yMax;
+    }
     return vertices;
 }
 
@@ -1350,6 +1506,192 @@ document.addEventListener('drop', e => {
         else if (f.type.startsWith('image/')) processImage(f);
     });
 });
+
+// ─── Sculpt Mode ─────────────────────────────────────────────────────────────
+window.setMode = function(mode) {
+    sculptMode = (mode === 'sculpt');
+    document.getElementById('btn-mode-particle').classList.toggle('active', !sculptMode);
+    document.getElementById('btn-mode-sculpt').classList.toggle('active', sculptMode);
+    document.getElementById('sculpt-section').classList.toggle('visible', sculptMode);
+    document.getElementById('brush-cursor').style.display = sculptMode ? 'block' : 'none';
+
+    if (sculptMode) {
+        // Disable orbit controls so drag = sculpt, not rotate
+        controls.enabled = false;
+        // Switch to zone coloring
+        colorMode = 'zone';
+        ['untextured','textured','aurora','thermal'].forEach(m =>
+            document.getElementById('btn-' + m)?.classList.remove('active')
+        );
+    } else {
+        controls.enabled = true;
+    }
+    syncUniforms();
+};
+
+window.setBrush = function(type) {
+    brushType = type;
+    ['push','pull','smooth'].forEach(t =>
+        document.getElementById('btn-brush-' + t)?.classList.toggle('active', t === type)
+    );
+};
+
+window.resetSculpt = function() {
+    if (!points) return;
+    const attr = points.geometry.attributes.aDeformation;
+    attr.array.fill(0);
+    attr.needsUpdate = true;
+    // Reset sliders
+    ['head','torso','legs'].forEach(k => {
+        document.getElementById('sl-' + k).value = 1.0;
+        document.getElementById('sl-' + k + '-val').textContent = '1.0';
+    });
+    if (points) {
+        const u = points.material.uniforms;
+        u.uHeadScale.value = 1.0;
+        u.uTorsoScale.value = 1.0;
+        u.uLegScale.value = 1.0;
+    }
+};
+
+// Brush size / strength sliders
+document.getElementById('brush-size').addEventListener('input', e => {
+    brushSize = parseFloat(e.target.value);
+    document.getElementById('brush-size-val').textContent = brushSize.toFixed(1);
+});
+document.getElementById('brush-strength').addEventListener('input', e => {
+    brushStrength = parseFloat(e.target.value);
+    document.getElementById('brush-strength-val').textContent = brushStrength.toFixed(2);
+});
+
+// Body sliders
+['head','torso','legs'].forEach(zone => {
+    const slider = document.getElementById('sl-' + zone);
+    const valEl  = document.getElementById('sl-' + zone + '-val');
+    slider.addEventListener('input', () => {
+        valEl.textContent = parseFloat(slider.value).toFixed(2);
+        if (!points) return;
+        const u = points.material.uniforms;
+        if (zone === 'head')  u.uHeadScale.value  = parseFloat(slider.value);
+        if (zone === 'torso') u.uTorsoScale.value = parseFloat(slider.value);
+        if (zone === 'legs')  u.uLegScale.value   = parseFloat(slider.value);
+    });
+});
+
+// Zone color pickers
+['head','body','legs'].forEach(zone => {
+    const picker = document.getElementById('zc-' + zone);
+    picker.addEventListener('input', () => {
+        if (!points) return;
+        const hex = picker.value;
+        const r = parseInt(hex.slice(1,3), 16) / 255;
+        const g = parseInt(hex.slice(3,5), 16) / 255;
+        const b = parseInt(hex.slice(5,7), 16) / 255;
+        const u = points.material.uniforms;
+        const key = zone === 'head' ? 'uZoneColorHead' : zone === 'body' ? 'uZoneColorBody' : 'uZoneColorLegs';
+        u[key].value.set(r, g, b);
+    });
+});
+
+// Sculpt brush: raycasting on mouse drag
+const brushCursor = document.getElementById('brush-cursor');
+const raycaster = new THREE.Raycaster();
+
+function sculptApplyBrush(clientX, clientY) {
+    if (!points || !sculptMode || !sculptMouseDown) return;
+
+    // World-space mouse position at z=0 plane
+    const ndcX =  (clientX / window.innerWidth) * 2 - 1;
+    const ndcY = -(clientY / window.innerHeight) * 2 + 1;
+    const vec = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera);
+    const dir = vec.sub(camera.position).normalize();
+    const dist = -camera.position.z / dir.z;
+    const worldPos = camera.position.clone().add(dir.multiplyScalar(dist));
+
+    // Model is scaled by points.scale (4), offset that
+    const scale = points.scale.x;
+    const localX = worldPos.x / scale;
+    const localY = worldPos.y / scale;
+
+    const posArr = points.geometry.attributes.position.array;
+    const defArr = points.geometry.attributes.aDeformation.array;
+    const count = posArr.length / 3;
+    const r2 = brushSize * brushSize;
+
+    for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+        const px = posArr[i3] + defArr[i3];
+        const py = posArr[i3 + 1] + defArr[i3 + 1];
+        const dx = px - localX;
+        const dy = py - localY;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > r2) continue;
+
+        const falloff = 1.0 - Math.sqrt(d2) / brushSize; // 1 at center, 0 at edge
+        const strength = falloff * falloff * brushStrength;
+
+        if (brushType === 'push') {
+            // Push outward from brush center
+            const len = Math.sqrt(d2) || 0.001;
+            defArr[i3]     += (dx / len) * strength;
+            defArr[i3 + 1] += (dy / len) * strength;
+            defArr[i3 + 2] += (Math.random() - 0.5) * strength * 0.3;
+        } else if (brushType === 'pull') {
+            // Pull toward brush center
+            const len = Math.sqrt(d2) || 0.001;
+            defArr[i3]     -= (dx / len) * strength;
+            defArr[i3 + 1] -= (dy / len) * strength;
+        } else if (brushType === 'smooth') {
+            // Smooth: relax deformation toward zero
+            defArr[i3]     *= (1.0 - strength * 0.5);
+            defArr[i3 + 1] *= (1.0 - strength * 0.5);
+            defArr[i3 + 2] *= (1.0 - strength * 0.5);
+        }
+    }
+    points.geometry.attributes.aDeformation.needsUpdate = true;
+}
+
+// Mouse events for sculpt
+renderer.domElement.addEventListener('mousedown', (e) => {
+    if (!sculptMode) return;
+    if (e.button === 2) {
+        // Right click = temporarily allow orbit
+        controls.enabled = true;
+        return;
+    }
+    sculptMouseDown = true;
+    sculptApplyBrush(e.clientX, e.clientY);
+});
+
+renderer.domElement.addEventListener('mousemove', (e) => {
+    if (sculptMode) {
+        // Update brush cursor
+        const size = brushSize * points.scale.x * 40; // approximate screen size
+        brushCursor.style.left = e.clientX + 'px';
+        brushCursor.style.top = e.clientY + 'px';
+        brushCursor.style.width = size + 'px';
+        brushCursor.style.height = size + 'px';
+    }
+    if (sculptMouseDown) {
+        sculptApplyBrush(e.clientX, e.clientY);
+    }
+});
+
+window.addEventListener('mouseup', (e) => {
+    sculptMouseDown = false;
+    if (sculptMode && e.button === 2) {
+        controls.enabled = false;
+    }
+});
+
+// Scroll wheel = adjust brush size in sculpt mode
+renderer.domElement.addEventListener('wheel', (e) => {
+    if (!sculptMode) return;
+    e.preventDefault();
+    brushSize = Math.max(0.1, Math.min(3.0, brushSize - e.deltaY * 0.002));
+    document.getElementById('brush-size').value = brushSize;
+    document.getElementById('brush-size-val').textContent = brushSize.toFixed(1);
+}, { passive: false });
 
 // ─── Fullscreen ───────────────────────────────────────────────────────────────
 const uiOverlay = document.getElementById('ui-overlay');
